@@ -296,7 +296,7 @@ def process_batch(pod_id, iterationid, iterationtranid, config):
             # --------------------------------------------------------
             if freshness_image_paths:
                 logger.info("--- Running Freshness OCR on category-3 images ---")
-                freshness_results = run_freshness_on_images(freshness_image_paths)
+                freshness_results = run_freshness_on_images(freshness_image_paths, iterationid=iterationid)
                 upload_freshness_to_db(conn, cur, freshness_results)
             else:
                 logger.info("No category-3 images in this batch — skipping Freshness.")

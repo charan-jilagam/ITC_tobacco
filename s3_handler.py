@@ -72,7 +72,8 @@ class S3Handler:
                        storeid,
                        subcategory_id,
                        category_id,
-                       captured_timestamp
+                       captured_timestamp,
+                       uploadtimestamp
                 FROM tbco.file_upload
                 WHERE processed_flag = 'I'
                   AND podid = %s
@@ -93,7 +94,7 @@ class S3Handler:
         failed_files          = []
 
         for idx, (fid, storename, filename, storeid, subcat_id,
-                  category_id, captured_ts) in enumerate(rows, 1):
+                  category_id, captured_ts, upload_ts) in enumerate(rows, 1):
             try:
                 s3_key      = filename
                 clean_fname = self._clean(os.path.basename(filename))
@@ -101,12 +102,14 @@ class S3Handler:
 
                 try:
                     self.s3.download_file(self.bucket_name, s3_key, local_path)
-                    record = (fid, storename, clean_fname,
-                              local_path, s3_key, storeid, subcat_id, captured_ts)
 
                     if category_id == CATEGORY_YOLO:
+                        record = (fid, storename, clean_fname,
+                                  local_path, s3_key, storeid, subcat_id, captured_ts)
                         yolo_image_paths.append(record)
                     elif category_id == CATEGORY_FRESHNESS:
+                        record = (fid, storename, clean_fname,
+                                  local_path, s3_key, storeid, subcat_id, captured_ts, upload_ts)
                         freshness_image_paths.append(record)
 
                     if idx % 10 == 0 or idx == total:

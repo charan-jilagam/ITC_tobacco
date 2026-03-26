@@ -94,7 +94,7 @@ def extract_mfd_from_image(image_path):
         return None
 
 
-def run_freshness_on_images(freshness_image_paths):
+def run_freshness_on_images(freshness_image_paths, iterationid=None):
     """
     Run OCR-based freshness extraction on a list of category-3 images.
 
@@ -103,29 +103,34 @@ def run_freshness_on_images(freshness_image_paths):
     freshness_image_paths : list of 8-tuples
         (filesequenceid, storename, clean_filename, local_path,
          s3_key, storeid, subcategory_id, captured_timestamp)
+    iterationid : int | None
+        The pipeline-level iteration ID to tag each freshness record with.
 
     Returns
     -------
     list of dicts, one per image:
         {
           filesequenceid, storeid, clean_filename,
-          captured_timestamp, mfg_date   (datetime | None)
+          captured_timestamp, mfg_date   (datetime | None),
+          iterationid
         }
     """
     results = []
 
     for (fid, storename, clean_fname, local_path,
-         s3_key, storeid, subcat_id, captured_ts) in freshness_image_paths:
+         s3_key, storeid, subcat_id, captured_ts, upload_ts) in freshness_image_paths:
 
         logger.info(f"Freshness OCR: {clean_fname}")
         mfg_date = extract_mfd_from_image(local_path)
 
         results.append({
-            'filesequenceid':   fid,
-            'storeid':          storeid,
-            'clean_filename':   clean_fname,
+            'filesequenceid':     fid,
+            'storeid':            storeid,
+            'clean_filename':     clean_fname,
+            'capture_date':       upload_ts,       # uploadtimestamp from file_upload
             'captured_timestamp': captured_ts,
-            'mfg_date':         mfg_date,
+            'mfg_date':           mfg_date,
+            'iterationid':        iterationid,
         })
 
     logger.info(
@@ -153,8 +158,8 @@ def upload_freshness_to_db(conn, cur, freshness_results):
     """
     insert_sql = """
         INSERT INTO tbco.product_freshness
-            (store_id, capture_date, mfg_date, image_file_name)
-        VALUES (%s, %s, %s, %s)
+            (iteration_id, store_id, capture_date, mfg_date, image_file_name)
+        VALUES (%s, %s, %s, %s, %s)
     """
 
     inserted = 0
@@ -170,9 +175,10 @@ def upload_freshness_to_db(conn, cur, freshness_results):
 
         try:
             cur.execute(insert_sql, (
+                rec['iterationid'],
                 rec['storeid'],
-                rec['captured_timestamp'],   # capture_date from file_upload
-                rec['mfg_date'],             # extracted by OCR
+                rec['capture_date'],         # uploadtimestamp from file_upload
+                rec['mfg_date'],
                 rec['clean_filename'],
             ))
             inserted += 1
