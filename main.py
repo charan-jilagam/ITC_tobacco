@@ -3,11 +3,15 @@ Tobacco Products - YOLO Detection + Freshness Pipeline
 =======================================================
 Driver script:
     • Fetches images from tbco.file_upload
+    • Batch unit = STORE (user picks how many stores per batch)
+      All images belonging to the selected stores are processed together.
     • category_id = 2  →  YOLO detection
           results → tbco.product_count_master + tbco.product_count_transaction
           annotated images uploaded to S3 model_results/
     • category_id = 3  →  Freshness OCR
           results → tbco.product_freshness
+
+    iterationid is fixed for the ENTIRE pipeline run (set once at startup).
 
 Usage:
     python main.py <pod-id>
@@ -47,12 +51,19 @@ logger = logging.getLogger(__name__)
 STALE_TIMEOUT_MINUTES = 60
 
 
-def get_unprocessed_count(conn):
-    """Count images with processed_flag = 'P' or NULL for category 2 or 3."""
+# ---------------------------------------------------------------------------
+# Store-based helpers
+# ---------------------------------------------------------------------------
+
+def get_unprocessed_store_count(conn):
+    """
+    Count distinct stores that still have unprocessed images
+    (processed_flag = 'P' or NULL) for category 2 or 3.
+    """
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT COUNT(*)
+            SELECT COUNT(DISTINCT storeid)
             FROM tbco.file_upload
             WHERE (processed_flag = 'P' OR processed_flag IS NULL)
               AND category_id IN (2, 3)
@@ -61,12 +72,37 @@ def get_unprocessed_count(conn):
         cur.close()
         return count
     except Exception as e:
-        logger.error(f"Failed to get unprocessed count: {e}")
+        logger.error(f"Failed to get unprocessed store count: {e}")
         return 0
 
 
+def get_unprocessed_store_summary(conn):
+    """
+    Return list of (storeid, storename, image_count) for all stores
+    that still have unprocessed images, ordered by oldest upload first.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT storeid,
+                   MAX(storename)   AS storename,
+                   COUNT(*)         AS image_count
+            FROM tbco.file_upload
+            WHERE (processed_flag = 'P' OR processed_flag IS NULL)
+              AND category_id IN (2, 3)
+            GROUP BY storeid
+            ORDER BY MIN(uploadtimestamp) ASC
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        return rows          # [(storeid, storename, image_count), ...]
+    except Exception as e:
+        logger.error(f"Failed to get store summary: {e}")
+        return []
+
+
 def reset_stale_assignments(conn, timeout_minutes):
-    """Reset images stuck in 'I' state beyond timeout."""
+    """Reset images stuck in 'I' state beyond timeout back to 'P'."""
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -89,45 +125,65 @@ def reset_stale_assignments(conn, timeout_minutes):
         return 0
 
 
-def assign_images_to_pod(conn, batch_size, pod_id):
-    """Mark batch_size images (category 2 or 3) as 'I' and assign to pod_id."""
+def assign_stores_to_pod(conn, store_batch_size, pod_id):
+    """
+    Pick the next `store_batch_size` stores (by oldest upload) and mark
+    ALL their unprocessed images as 'I', assigned to pod_id.
+
+    Returns
+    -------
+    (assigned_image_count, store_ids_assigned)
+    """
     try:
         cur = conn.cursor()
 
+        # Get the next N stores with unprocessed images
         cur.execute("""
-            SELECT filesequenceid
+            SELECT storeid
             FROM tbco.file_upload
             WHERE (processed_flag = 'P' OR processed_flag IS NULL)
               AND category_id IN (2, 3)
-            ORDER BY uploadtimestamp ASC
+            GROUP BY storeid
+            ORDER BY MIN(uploadtimestamp) ASC
             LIMIT %s
-        """, (batch_size,))
+        """, (store_batch_size,))
 
-        ids = [row[0] for row in cur.fetchall()]
-        if not ids:
+        store_ids = [row[0] for row in cur.fetchall()]
+        if not store_ids:
             cur.close()
-            return 0
+            return 0, []
 
+        # Assign ALL images of those stores to this pod
         cur.execute("""
             UPDATE tbco.file_upload
             SET processed_flag = 'I', podid = %s
-            WHERE filesequenceid = ANY(%s)
-        """, (pod_id, ids))
+            WHERE (processed_flag = 'P' OR processed_flag IS NULL)
+              AND category_id IN (2, 3)
+              AND storeid = ANY(%s)
+        """, (pod_id, store_ids))
 
-        assigned = cur.rowcount
+        assigned_images = cur.rowcount
         conn.commit()
         cur.close()
-        logger.info(f"Assigned {assigned} images to {pod_id}")
-        return assigned
+
+        logger.info(
+            f"Assigned {assigned_images} images from "
+            f"{len(store_ids)} stores to {pod_id} | "
+            f"stores: {store_ids}"
+        )
+        return assigned_images, store_ids
 
     except Exception as e:
-        logger.error(f"Failed to assign images to pod: {e}")
+        logger.error(f"Failed to assign stores to pod: {e}")
         conn.rollback()
-        return 0
+        return 0, []
 
 
 def get_next_iteration_ids(conn):
-    """Get next iterationid and iterationtranid from product_count_master."""
+    """
+    Get next iterationid and starting iterationtranid from product_count_master.
+    Called ONCE at pipeline startup — both values are fixed for the entire run.
+    """
     try:
         cur = conn.cursor()
         cur.execute(
@@ -145,12 +201,19 @@ def get_next_iteration_ids(conn):
         return 1, 1
 
 
+# ---------------------------------------------------------------------------
+# Batch processor
+# ---------------------------------------------------------------------------
+
 def process_batch(pod_id, iterationid, iterationtranid, config):
     """
-    Download images → split by category →
-        cat 2: run YOLO  → store in product_count_master / product_count_transaction
-        cat 3: run OCR   → store in product_freshness
-    → mark all processed.
+    Download images for pod_id → split by category →
+        cat 2: YOLO  → product_count_master / product_count_transaction
+        cat 3: OCR   → product_freshness
+    → mark all processed 'Y'.
+
+    Returns (success: bool, next_iterationtranid: int)
+    iterationid is NEVER modified here — it belongs to the whole run.
     """
     conn = None
     cur  = None
@@ -177,8 +240,8 @@ def process_batch(pod_id, iterationid, iterationtranid, config):
                 return False, iterationtranid
 
             logger.info(
-                f"Downloaded: {len(yolo_image_paths)} YOLO, "
-                f"{len(freshness_image_paths)} Freshness, "
+                f"Downloaded: {len(yolo_image_paths)} YOLO images, "
+                f"{len(freshness_image_paths)} Freshness images, "
                 f"{len(failed_files)} failed"
             )
 
@@ -200,13 +263,12 @@ def process_batch(pod_id, iterationid, iterationtranid, config):
                     s3_output_folder=s3_config.get(
                         'results_folder_s3', 'model_results/'
                     ),
-                    iterationid=iterationid
+                    iterationid=iterationid       # same iterationid for whole run
                 )
                 logger.info(
                     f"YOLO complete: {len(detection_results)} detection records"
                 )
 
-                # image_meta: filename -> (storeid, subcategory_id)
                 image_meta = {
                     clean_fname: (storeid, subcat_id)
                     for _, _, clean_fname, _, _, storeid, subcat_id, _
@@ -227,7 +289,7 @@ def process_batch(pod_id, iterationid, iterationtranid, config):
                     detection_results=detection_results
                 )
             else:
-                logger.info("No category-2 images — skipping YOLO.")
+                logger.info("No category-2 images in this batch — skipping YOLO.")
 
             # --------------------------------------------------------
             # 2b. Freshness pipeline (category_id = 3)
@@ -237,10 +299,10 @@ def process_batch(pod_id, iterationid, iterationtranid, config):
                 freshness_results = run_freshness_on_images(freshness_image_paths)
                 upload_freshness_to_db(conn, cur, freshness_results)
             else:
-                logger.info("No category-3 images — skipping Freshness OCR.")
+                logger.info("No category-3 images in this batch — skipping Freshness.")
 
             # --------------------------------------------------------
-            # 3. Mark all successfully downloaded images as processed 'Y'
+            # 3. Mark all downloaded images as processed 'Y'
             # --------------------------------------------------------
             all_processed_ids = (
                 [fp[0] for fp in yolo_image_paths]
@@ -257,7 +319,7 @@ def process_batch(pod_id, iterationid, iterationtranid, config):
                     f"Marked {len(all_processed_ids)} images as processed (Y)"
                 )
 
-            # Reset failed files back to 'P' for retry
+            # Reset any failed downloads back to 'P' for retry
             if failed_files:
                 failed_ids = [f[0] for f in failed_files]
                 cur.execute("""
@@ -284,6 +346,10 @@ def process_batch(pod_id, iterationid, iterationtranid, config):
             close_db_connection(conn, cur)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
     if len(sys.argv) < 2:
         logger.error("Usage: python main.py <pod-id>")
@@ -299,7 +365,10 @@ def main():
     config    = load_config('config.json')
     db_config = config['db_config']
 
-    # Get shared iteration IDs for this run
+    # ------------------------------------------------------------------
+    # Get iteration IDs ONCE — iterationid is fixed for the entire run.
+    # iterationtranid advances per image across all batches.
+    # ------------------------------------------------------------------
     conn, cur = initialize_db_connection(db_config)
     iterationid, iterationtranid = get_next_iteration_ids(conn)
     close_db_connection(conn, cur)
@@ -307,61 +376,102 @@ def main():
     logger.info("=" * 60)
     logger.info(
         f"Pipeline Run | pod={pod_id} | "
-        f"iterationid={iterationid} | iterationtranid={iterationtranid}"
+        f"iterationid={iterationid} (fixed for this run) | "
+        f"iterationtranid starts at {iterationtranid}"
     )
     logger.info("=" * 60)
 
-    batch_size   = None
-    batch_number = 0
+    store_batch_size = None   # asked once, reused for every batch
+    batch_number     = 0
 
     while True:
         try:
+            # --------------------------------------------------------
+            # Check remaining work — in STORES not images
+            # --------------------------------------------------------
             conn, cur = initialize_db_connection(db_config)
             reset_stale_assignments(conn, STALE_TIMEOUT_MINUTES)
-            remaining = get_unprocessed_count(conn)
-            close_db_connection(conn, cur)
+            remaining_stores = get_unprocessed_store_count(conn)
 
-            if remaining == 0:
+            if remaining_stores == 0:
+                close_db_connection(conn, cur)
                 logger.info("=" * 60)
                 logger.info(
-                    f"All images processed. Total batches: {batch_number}"
+                    f"All stores processed. "
+                    f"Total batches: {batch_number} | "
+                    f"iterationid used: {iterationid}"
                 )
                 logger.info("=" * 60)
                 break
 
-            logger.info(f"Unprocessed images remaining: {remaining}")
-
-            if batch_size is None:
-                while True:
-                    try:
-                        batch_input = input(
-                            f"Enter batch size (1-{remaining}): "
-                        ).strip()
-                        batch_size  = int(batch_input)
-                        if 1 <= batch_size <= remaining:
-                            break
-                        print(f"Enter a number between 1 and {remaining}")
-                    except ValueError:
-                        print("Enter a valid integer")
-
-            conn, cur = initialize_db_connection(db_config)
-            assigned  = assign_images_to_pod(conn, batch_size, pod_id)
+            # Show a per-store breakdown for visibility
+            store_summary = get_unprocessed_store_summary(conn)
             close_db_connection(conn, cur)
 
-            if assigned == 0:
+            logger.info(
+                f"Unprocessed stores remaining: {remaining_stores}"
+            )
+            logger.info("  Store breakdown:")
+            for storeid, storename, img_count in store_summary:
+                logger.info(
+                    f"    storeid={storeid}  name={storename}  images={img_count}"
+                )
+
+            # --------------------------------------------------------
+            # Ask batch size in stores (only once per run)
+            # --------------------------------------------------------
+            if store_batch_size is None:
+                while True:
+                    try:
+                        raw = input(
+                            f"\nEnter number of stores to process per batch "
+                            f"(1-{remaining_stores}): "
+                        ).strip()
+                        store_batch_size = int(raw)
+                        if 1 <= store_batch_size <= remaining_stores:
+                            break
+                        print(
+                            f"Please enter a number between 1 "
+                            f"and {remaining_stores}"
+                        )
+                    except ValueError:
+                        print("Please enter a valid integer.")
+
+            # --------------------------------------------------------
+            # Assign next N stores to this pod
+            # --------------------------------------------------------
+            conn, cur = initialize_db_connection(db_config)
+            assigned_images, assigned_store_ids = assign_stores_to_pod(
+                conn, store_batch_size, pod_id
+            )
+            close_db_connection(conn, cur)
+
+            if assigned_images == 0:
                 logger.warning("No images assigned. Retrying in 10s…")
                 time.sleep(10)
                 continue
 
             batch_number += 1
-            logger.info(f"--- Batch {batch_number}: {assigned} images ---")
+            logger.info(
+                f"--- Batch {batch_number} | "
+                f"stores={len(assigned_store_ids)} | "
+                f"images={assigned_images} | "
+                f"iterationid={iterationid} ---"
+            )
 
+            # --------------------------------------------------------
+            # Process the batch
+            # --------------------------------------------------------
             success, new_iterationtranid = process_batch(
                 pod_id, iterationid, iterationtranid, config
             )
 
             if success:
-                logger.info(f"Batch {batch_number} completed successfully")
+                logger.info(
+                    f"Batch {batch_number} completed successfully | "
+                    f"iterationtranid advanced "
+                    f"{iterationtranid} → {new_iterationtranid - 1}"
+                )
                 iterationtranid = new_iterationtranid
                 time.sleep(2)
             else:

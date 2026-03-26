@@ -1,9 +1,4 @@
-# Models
-*.pt
-*.pth
-*.onnx
-*.engine
-*.ckpt
+
 
 # Python
 __pycache__/
