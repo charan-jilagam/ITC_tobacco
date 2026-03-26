@@ -1,0 +1,29 @@
+# Models
+*.pt
+*.pth
+*.onnx
+*.engine
+*.ckpt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env / secrets
+.env
+config.json
+
+# Outputs
+outputs/
+logs/
+*.log
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# OS / editor
+.DS_Store

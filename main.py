@@ -1,0 +1,386 @@
+"""
+Tobacco Products - YOLO Detection + Freshness Pipeline
+=======================================================
+Driver script:
+    • Fetches images from tbco.file_upload
+    • category_id = 2  →  YOLO detection
+          results → tbco.product_count_master + tbco.product_count_transaction
+          annotated images uploaded to S3 model_results/
+    • category_id = 3  →  Freshness OCR
+          results → tbco.product_freshness
+
+Usage:
+    python main.py <pod-id>
+    python main.py pod-1
+"""
+
+import sys
+import os
+import logging
+import tempfile
+import traceback
+import time
+
+from config_loader import load_config
+from db_handler import initialize_db_connection, close_db_connection
+from s3_handler import S3Handler
+from yolo_runner import run_yolo_on_images
+from result_uploader import upload_results_to_db
+from freshness_runner import run_freshness_on_images, upload_freshness_to_db
+
+os.makedirs('outputs', exist_ok=True)
+
+# UTF-8 handlers — prevents UnicodeEncodeError on Windows (cp1252 console)
+_file_handler   = logging.FileHandler('outputs/pipeline.log', encoding='utf-8')
+_stream_handler = logging.StreamHandler()
+_stream_handler.stream = open(
+    sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[_file_handler, _stream_handler]
+)
+logger = logging.getLogger(__name__)
+
+STALE_TIMEOUT_MINUTES = 60
+
+
+def get_unprocessed_count(conn):
+    """Count images with processed_flag = 'P' or NULL for category 2 or 3."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM tbco.file_upload
+            WHERE (processed_flag = 'P' OR processed_flag IS NULL)
+              AND category_id IN (2, 3)
+        """)
+        count = cur.fetchone()[0]
+        cur.close()
+        return count
+    except Exception as e:
+        logger.error(f"Failed to get unprocessed count: {e}")
+        return 0
+
+
+def reset_stale_assignments(conn, timeout_minutes):
+    """Reset images stuck in 'I' state beyond timeout."""
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE tbco.file_upload
+            SET processed_flag = 'P', podid = NULL
+            WHERE processed_flag = 'I'
+              AND uploadtimestamp < NOW() - INTERVAL '%s minutes'
+        """ % timeout_minutes)
+        reset_count = cur.rowcount
+        conn.commit()
+        cur.close()
+        if reset_count > 0:
+            logger.warning(
+                f"Reset {reset_count} stale images (stuck > {timeout_minutes} min)"
+            )
+        return reset_count
+    except Exception as e:
+        logger.error(f"Failed to reset stale assignments: {e}")
+        conn.rollback()
+        return 0
+
+
+def assign_images_to_pod(conn, batch_size, pod_id):
+    """Mark batch_size images (category 2 or 3) as 'I' and assign to pod_id."""
+    try:
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT filesequenceid
+            FROM tbco.file_upload
+            WHERE (processed_flag = 'P' OR processed_flag IS NULL)
+              AND category_id IN (2, 3)
+            ORDER BY uploadtimestamp ASC
+            LIMIT %s
+        """, (batch_size,))
+
+        ids = [row[0] for row in cur.fetchall()]
+        if not ids:
+            cur.close()
+            return 0
+
+        cur.execute("""
+            UPDATE tbco.file_upload
+            SET processed_flag = 'I', podid = %s
+            WHERE filesequenceid = ANY(%s)
+        """, (pod_id, ids))
+
+        assigned = cur.rowcount
+        conn.commit()
+        cur.close()
+        logger.info(f"Assigned {assigned} images to {pod_id}")
+        return assigned
+
+    except Exception as e:
+        logger.error(f"Failed to assign images to pod: {e}")
+        conn.rollback()
+        return 0
+
+
+def get_next_iteration_ids(conn):
+    """Get next iterationid and iterationtranid from product_count_master."""
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(MAX(iterationid), 0) FROM tbco.product_count_master"
+        )
+        max_iter = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COALESCE(MAX(iterationtranid), 0) FROM tbco.product_count_master"
+        )
+        max_tran = cur.fetchone()[0]
+        cur.close()
+        return max_iter + 1, max_tran + 1
+    except Exception as e:
+        logger.error(f"Failed to get iteration IDs: {e}")
+        return 1, 1
+
+
+def process_batch(pod_id, iterationid, iterationtranid, config):
+    """
+    Download images → split by category →
+        cat 2: run YOLO  → store in product_count_master / product_count_transaction
+        cat 3: run OCR   → store in product_freshness
+    → mark all processed.
+    """
+    conn = None
+    cur  = None
+    try:
+        db_config   = config['db_config']
+        s3_config   = config['s3_config']
+        yolo_config = config['yolo_config']
+
+        conn, cur = initialize_db_connection(db_config)
+        s3_handler = S3Handler(s3_config, db_config)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            logger.info(f"Temp dir: {temp_dir}")
+
+            # --------------------------------------------------------
+            # 1. Download images — split into YOLO (cat 2) and
+            #    Freshness (cat 3) lists
+            # --------------------------------------------------------
+            yolo_image_paths, freshness_image_paths, failed_files = \
+                s3_handler.download_images_from_s3(temp_dir, pod_id)
+
+            if not yolo_image_paths and not freshness_image_paths:
+                logger.warning(f"No images downloaded for {pod_id}")
+                return False, iterationtranid
+
+            logger.info(
+                f"Downloaded: {len(yolo_image_paths)} YOLO, "
+                f"{len(freshness_image_paths)} Freshness, "
+                f"{len(failed_files)} failed"
+            )
+
+            new_iterationtranid = iterationtranid
+
+            # --------------------------------------------------------
+            # 2a. YOLO pipeline (category_id = 2)
+            # --------------------------------------------------------
+            if yolo_image_paths:
+                logger.info("--- Running YOLO on category-2 images ---")
+                detection_results = run_yolo_on_images(
+                    image_paths=yolo_image_paths,
+                    model_path=yolo_config['model_path'],
+                    conf_threshold=yolo_config.get('conf_threshold', 0.3),
+                    output_folder=yolo_config.get(
+                        'annotated_output_folder', 'outputs/annotated/'
+                    ),
+                    s3_handler=s3_handler,
+                    s3_output_folder=s3_config.get(
+                        'results_folder_s3', 'model_results/'
+                    ),
+                    iterationid=iterationid
+                )
+                logger.info(
+                    f"YOLO complete: {len(detection_results)} detection records"
+                )
+
+                # image_meta: filename -> (storeid, subcategory_id)
+                image_meta = {
+                    clean_fname: (storeid, subcat_id)
+                    for _, _, clean_fname, _, _, storeid, subcat_id, _
+                    in yolo_image_paths
+                }
+                image_order = [
+                    clean_fname
+                    for _, _, clean_fname, _, _, _, _, _ in yolo_image_paths
+                ]
+
+                new_iterationtranid = upload_results_to_db(
+                    conn=conn,
+                    cur=cur,
+                    iterationid=iterationid,
+                    iterationtranid_start=iterationtranid,
+                    image_meta=image_meta,
+                    image_order=image_order,
+                    detection_results=detection_results
+                )
+            else:
+                logger.info("No category-2 images — skipping YOLO.")
+
+            # --------------------------------------------------------
+            # 2b. Freshness pipeline (category_id = 3)
+            # --------------------------------------------------------
+            if freshness_image_paths:
+                logger.info("--- Running Freshness OCR on category-3 images ---")
+                freshness_results = run_freshness_on_images(freshness_image_paths)
+                upload_freshness_to_db(conn, cur, freshness_results)
+            else:
+                logger.info("No category-3 images — skipping Freshness OCR.")
+
+            # --------------------------------------------------------
+            # 3. Mark all successfully downloaded images as processed 'Y'
+            # --------------------------------------------------------
+            all_processed_ids = (
+                [fp[0] for fp in yolo_image_paths]
+                + [fp[0] for fp in freshness_image_paths]
+            )
+            if all_processed_ids:
+                cur.execute("""
+                    UPDATE tbco.file_upload
+                    SET processed_flag = 'Y'
+                    WHERE filesequenceid = ANY(%s)
+                """, (all_processed_ids,))
+                conn.commit()
+                logger.info(
+                    f"Marked {len(all_processed_ids)} images as processed (Y)"
+                )
+
+            # Reset failed files back to 'P' for retry
+            if failed_files:
+                failed_ids = [f[0] for f in failed_files]
+                cur.execute("""
+                    UPDATE tbco.file_upload
+                    SET processed_flag = 'P', podid = NULL
+                    WHERE filesequenceid = ANY(%s)
+                """, (failed_ids,))
+                conn.commit()
+                logger.warning(
+                    f"Reset {len(failed_ids)} failed images to 'P'"
+                )
+
+        return True, new_iterationtranid
+
+    except Exception as e:
+        logger.error(f"Batch processing failed: {e}")
+        logger.error(traceback.format_exc())
+        if conn:
+            conn.rollback()
+        return False, iterationtranid
+
+    finally:
+        if conn:
+            close_db_connection(conn, cur)
+
+
+def main():
+    if len(sys.argv) < 2:
+        logger.error("Usage: python main.py <pod-id>")
+        logger.error("Example: python main.py pod-1")
+        sys.exit(1)
+
+    pod_id = sys.argv[1]
+    logger.info(f"Starting tobacco pipeline for pod: {pod_id}")
+
+    os.makedirs('outputs', exist_ok=True)
+    os.makedirs('outputs/annotated', exist_ok=True)
+
+    config    = load_config('config.json')
+    db_config = config['db_config']
+
+    # Get shared iteration IDs for this run
+    conn, cur = initialize_db_connection(db_config)
+    iterationid, iterationtranid = get_next_iteration_ids(conn)
+    close_db_connection(conn, cur)
+
+    logger.info("=" * 60)
+    logger.info(
+        f"Pipeline Run | pod={pod_id} | "
+        f"iterationid={iterationid} | iterationtranid={iterationtranid}"
+    )
+    logger.info("=" * 60)
+
+    batch_size   = None
+    batch_number = 0
+
+    while True:
+        try:
+            conn, cur = initialize_db_connection(db_config)
+            reset_stale_assignments(conn, STALE_TIMEOUT_MINUTES)
+            remaining = get_unprocessed_count(conn)
+            close_db_connection(conn, cur)
+
+            if remaining == 0:
+                logger.info("=" * 60)
+                logger.info(
+                    f"All images processed. Total batches: {batch_number}"
+                )
+                logger.info("=" * 60)
+                break
+
+            logger.info(f"Unprocessed images remaining: {remaining}")
+
+            if batch_size is None:
+                while True:
+                    try:
+                        batch_input = input(
+                            f"Enter batch size (1-{remaining}): "
+                        ).strip()
+                        batch_size  = int(batch_input)
+                        if 1 <= batch_size <= remaining:
+                            break
+                        print(f"Enter a number between 1 and {remaining}")
+                    except ValueError:
+                        print("Enter a valid integer")
+
+            conn, cur = initialize_db_connection(db_config)
+            assigned  = assign_images_to_pod(conn, batch_size, pod_id)
+            close_db_connection(conn, cur)
+
+            if assigned == 0:
+                logger.warning("No images assigned. Retrying in 10s…")
+                time.sleep(10)
+                continue
+
+            batch_number += 1
+            logger.info(f"--- Batch {batch_number}: {assigned} images ---")
+
+            success, new_iterationtranid = process_batch(
+                pod_id, iterationid, iterationtranid, config
+            )
+
+            if success:
+                logger.info(f"Batch {batch_number} completed successfully")
+                iterationtranid = new_iterationtranid
+                time.sleep(2)
+            else:
+                logger.error(
+                    f"Batch {batch_number} failed. Retrying in 10s…"
+                )
+                time.sleep(10)
+                continue
+
+        except KeyboardInterrupt:
+            logger.info("Pipeline interrupted by user.")
+            break
+        except Exception as e:
+            logger.error(f"Unexpected error in main loop: {e}")
+            logger.error(traceback.format_exc())
+            time.sleep(10)
+
+    logger.info(f"Pipeline finished for {pod_id}")
+
+
+if __name__ == "__main__":
+    main()
