@@ -2,7 +2,7 @@ import yaml
 from ultralytics import YOLO
 
 # -------- INPUTS --------
-model_path = "tobacco_yolo.pt"                     # your trained YOLO model
+model_path = "tobacco_v0.1.pt"                     # your trained YOLO model
 dataset_path = r"C:\dataset\yolo_dataset"  # dataset root folder
 train_path = "images/train"
 val_path = "images/val"
